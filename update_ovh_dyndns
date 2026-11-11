@@ -1,41 +1,160 @@
 #!/bin/bash
-
-LAST_IP_FILE=/var/cache/dyndns_ovh_last_ip
-LOG_FILE=/var/log/dyndns_ovh.log
-CONF_FILE=/etc/dyndns_ovh.conf
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAST_IP_FILE="${SCRIPT_DIR}/ovp_ip_update/last_ip"
+LOG_FILE="${SCRIPT_DIR}/ovp_ip_update/dyndns_ovh.log"
+CONF_FILE="${SCRIPT_DIR}/ovp_ip_update/dyndns_ovh.conf"
 DATE=$(date +%F-%H:%M:%S)
 
-if type -f dig &> /dev/null; then
-    function publicip() {
-		dig +short myip.opendns.com @resolver1.opendns.com -4
-	}
-else
-	if type -f curl &> /dev/null; then
-		function publicip() {
-			curl 4.icanhazip.com
-		}
-	else
-		echo -n "${DATE}	ERROR: Could not find curl nor dig" >> "${LOG_FILE}"
-	fi
+# ── helpers ──────────────────────────────────────────────────────────
+detect_ip() {
+    local ip1="" ip2="" ip3="" ip4=""
+    # Source 1: dig via OpenDNS (DNS)
+    if type -f dig &> /dev/null; then
+        ip1=$(dig +short +time=5 +tries=2 myip.opendns.com @resolver1.opendns.com -4 2>/dev/null)
+    fi
+    # Source 2: Cloudflare (HTTP)
+    ip2=$(curl -s --max-time 5 https://1.1.1.1/cdn-cgi/trace 2>/dev/null | grep '^ip=' | cut -d= -f2)
+    # Source 3: ipify (HTTP)
+    ip3=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null)
+    # Source 4: ipinfo.io (HTTP)
+    ip4=$(curl -s --max-time 5 https://ipinfo.io/ip 2>/dev/null)
+
+    # Collect all non-empty results
+    local results=()
+    [[ -n "$ip1" ]] && results+=("$ip1")
+    [[ -n "$ip2" ]] && results+=("$ip2")
+    [[ -n "$ip3" ]] && results+=("$ip3")
+    [[ -n "$ip4" ]] && results+=("$ip4")
+    if [[ ${#results[@]} -eq 0 ]]; then
+        echo ""
+        return 1
+    fi
+    # Count occurrences of each IP
+    declare -A counts
+    for ip in "${results[@]}"; do
+        counts["$ip"]=$(( ${counts["$ip"]:-0} + 1 ))
+    done
+    # Find the IP with the highest count
+    local best_ip="" best_count=0
+    for ip in "${!counts[@]}"; do
+        if [[ ${counts["$ip"]} -gt $best_count ]]; then
+            best_count=${counts["$ip"]}
+            best_ip="$ip"
+        fi
+    done
+
+    # Require at least 3 out of 4 to agree (or 2 out of 2 if only 2 sources available)
+    local total_sources=0
+    [[ -n "$ip1" ]] && ((total_sources++))
+    [[ -n "$ip2" ]] && ((total_sources++))
+    [[ -n "$ip3" ]] && ((total_sources++))
+    [[ -n "$ip4" ]] && ((total_sources++))
+
+    local required
+    if [[ $total_sources -le 2 ]]; then
+        required=2
+    else
+        required=3   # 3 out of 4
+    fi
+
+    if [[ $best_count -ge $required ]]; then
+        echo "$best_ip"
+        return 0
+    else
+        echo ""
+        return 1
+    fi
+}
+
+# ── read per-domain config ──────────────────────────────────────────
+# Expected format in CONF_FILE (one block per domain):
+#
+#   [domain]
+#   HOSTNAME=example.com
+#   PORT=8080           # optional – appended as :PORT
+#   USER=myuser
+#   PASS=mypass
+#
+# Blocks are separated by a line starting with [
+# ────────────────────────────────────────────────────────────────────
+
+# Parse CONF_FILE into parallel arrays
+declare -a HOSTNAMES PORTS USERS PASSWORDS
+current_hostname="" current_port="" current_user="" current_pass=""
+
+# Adds entry variables to arrays and clears
+appendflush_entry() {
+    if [[ -n "$current_hostname" ]]; then
+        HOSTNAMES+=("$current_hostname")
+        PORTS+=("${current_port:-}")
+        USERS+=("$current_user")
+        PASSWORDS+=("$current_pass")
+    fi
+    current_hostname="" current_port="" current_user="" current_pass=""
+}
+
+# Read all domain configs and add to list
+while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line//$'\r'/}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    # Clear old variables
+    if [[ "$line" =~ ^\[.*\]$ ]]; then
+        appendflush_entry
+        continue
+    fi
+    # Check if new block is hit in the looping
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+        HOSTNAME) current_hostname="$value" ;;
+        PORT)     current_port="$value" ;;
+        USER)     current_user="$value" ;;
+        PASS)     current_pass="$value" ;;
+    esac
+done < "$CONF_FILE"
+appendflush_entry
+# If nothing found, error and exit
+if [[ ${#HOSTNAMES[@]} -eq 0 ]]; then
+    echo -n "${DATE} --- ERROR: No domains found in ${CONF_FILE}" >> "$LOG_FILE"
+    echo "" >> "$LOG_FILE"
+    exit 1
 fi
 
-PUBLIC_IP=$(publicip)
-
-echo -n "${DATE}	${PUBLIC_IP}	" >> "${LOG_FILE}"
-
-if [ -e $LAST_IP_FILE ]; then
-	LAST_PUBLIC_IP=$(cat $LAST_IP_FILE)
-	if [ "$PUBLIC_IP" == "$LAST_PUBLIC_IP" ]; then
-		echo "IP did not change, skip update" >> "${LOG_FILE}"
-		exit 0;
-	fi
+# Get current IP address of the server
+detected_local_ip=$(detect_ip)
+# Check if IP detection failed globally before the loop
+if [[ -z "$detected_local_ip" ]]; then
+    echo -n "${DATE} --- [ERROR]: Could not determine public IP for any domain" >> "$LOG_FILE"
+    echo "" >> "$LOG_FILE"
+    exit 1
 fi
-echo "${PUBLIC_IP}" > "${LAST_IP_FILE}"
-
-DYNDNS_USER=$(cat ${CONF_FILE} | grep "^USER=" | cut -d'=' -f2-)
-DYNDNS_PASS=$(cat ${CONF_FILE} | grep "^PASS=" | cut -d'=' -f2-)
-DYNDNS_DOMAIN=$(cat ${CONF_FILE} | grep "^DOMAIN=" | cut -d'=' -f2-)
-
-# URL is taken from https://docs.ovh.com/fr/domains/utilisation-dynhost/
-curl -u ${DYNDNS_USER}:${DYNDNS_PASS} "http://www.ovh.com/nic/update?system=dyndns&hostname=${DYNDNS_DOMAIN}&myip=${PUBLIC_IP}" >> "${LOG_FILE}"
-echo "" >> "${LOG_FILE}"
+# Check if IP changed
+last_ip_file="${LAST_IP_FILE}.global"
+if [[ -e "$last_ip_file" ]]; then
+    last_ip=$(cat "$last_ip_file")
+    if [[ "$detected_local_ip" == "$last_ip" ]]; then
+        echo -n "${DATE} --- [NO IP UPDATE] IP did not change, skip update" >> "$LOG_FILE"
+        echo "" >> "$LOG_FILE"
+        exit 1
+    fi
+fi
+# Iterate over each domain entry in the config
+for i in "${!HOSTNAMES[@]}"; do
+    hostname="${HOSTNAMES[$i]}"
+    port="${PORTS[$i]}"
+    user="${USERS[$i]}"
+    pass="${PASSWORDS[$i]}"
+    ip_to_send="$detected_local_ip"
+    # Build the port suffix
+    port_suffix=""
+    if [[ -n "$port" ]]; then
+        port_suffix=":${port}"
+    fi
+    # send out the update
+    url="http://www.ovh.com/nic/update?system=dyndns&hostname=${hostname}${port_suffix}&myip=${ip_to_send}"
+    curl -s -u "${user}:${pass}" "$url" >> "$LOG_FILE" 2>&1
+    echo -n "${DATE} --- [IP UPDATED] ${hostname} -> ${ip_to_send}${port_suffix}" >> "$LOG_FILE"
+    echo "" >> "$LOG_FILE"
+    # Save last IP for this domain
+    echo "$ip_to_send" > "$last_ip_file"
+done
