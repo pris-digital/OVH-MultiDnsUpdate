@@ -1,8 +1,8 @@
 #!/bin/bash
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LAST_IP_FILE="${SCRIPT_DIR}/ovp_ip_update/last_ip"
-LOG_FILE="${SCRIPT_DIR}/ovp_ip_update/dyndns_ovh.log"
-CONF_FILE="${SCRIPT_DIR}/ovp_ip_update/dyndns_ovh.conf"
+LAST_IP_FILE="${SCRIPT_DIR}/OVH-MultiDnsUpdate/last_ip"
+LOG_FILE="${SCRIPT_DIR}/OVH-MultiDnsUpdate/dyndns_ovh.log"
+CONF_FILE="${SCRIPT_DIR}/OVH-MultiDnsUpdate/dyndns_ovh.conf"
 DATE=$(date +%F-%H:%M:%S)
 
 # ── helpers ──────────────────────────────────────────────────────────
